@@ -73,6 +73,73 @@ import { AccountPool } from "./lib/account-pool.js";
  * ```
  */
 export const OpenAIAuthPlugin: Plugin = async ({ client }: PluginInput) => {
+	const TRANSIENT_RETRY_STATUSES = new Set([500, 502, 503, 504, 529]);
+	const MAX_TRANSIENT_RETRIES = 2;
+	const BASE_TRANSIENT_BACKOFF_MS = 300;
+	const MAX_TRANSIENT_BACKOFF_MS = 5000;
+
+	const sleep = async (ms: number): Promise<void> => {
+		await new Promise((resolve) => {
+			setTimeout(resolve, ms);
+		});
+	};
+
+	const parseRetryAfterMs = (headers: Headers): number | null => {
+		const retryAfter = headers.get("retry-after");
+		if (!retryAfter) return null;
+
+		const delaySeconds = Number.parseInt(retryAfter, 10);
+		if (!Number.isNaN(delaySeconds) && delaySeconds > 0) {
+			return delaySeconds * 1000;
+		}
+
+		const retryDateMs = Date.parse(retryAfter);
+		if (Number.isNaN(retryDateMs)) return null;
+		const remainingMs = retryDateMs - Date.now();
+		if (remainingMs <= 0) return null;
+		return remainingMs;
+	};
+
+	const getTransientRetryDelayMs = (retry: number, headers: Headers): number => {
+		const retryAfterMs = parseRetryAfterMs(headers);
+		if (retryAfterMs && retryAfterMs > 0) {
+			return Math.min(retryAfterMs, MAX_TRANSIENT_BACKOFF_MS);
+		}
+
+		const exponentialDelay = Math.min(
+			BASE_TRANSIENT_BACKOFF_MS * 2 ** retry,
+			MAX_TRANSIENT_BACKOFF_MS,
+		);
+		const jitterFloor = Math.floor(exponentialDelay / 2);
+		const jitterRange = exponentialDelay - jitterFloor;
+		return jitterFloor + Math.floor(Math.random() * Math.max(1, jitterRange));
+	};
+
+	const persistOAuthAccountInPool = (tokens: {
+		access: string;
+		refresh: string;
+		expires: number;
+	}) => {
+		const decoded = decodeJWT(tokens.access);
+		const tokenAccountId = decoded?.[JWT_CLAIM_PATH]?.chatgpt_account_id;
+		if (!tokenAccountId) {
+			return;
+		}
+		try {
+			const pool = AccountPool.load();
+			pool.upsert({
+				accountId: tokenAccountId,
+				access: tokens.access,
+				refresh: tokens.refresh,
+				expires: tokens.expires,
+				email: typeof decoded?.email === "string" ? decoded.email : undefined,
+			});
+			pool.save();
+		} catch (error) {
+			logWarn("Failed to persist account in pool after OAuth", error);
+		}
+	};
+
 	const buildManualOAuthFlow = (pkce: { verifier: string }, url: string) => ({
 		url,
 		method: "code" as const,
@@ -87,7 +154,11 @@ export const OpenAIAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 				pkce.verifier,
 				REDIRECT_URI,
 			);
-			return tokens?.type === "success" ? tokens : { type: "failed" as const };
+			if (tokens?.type === "success") {
+				persistOAuthAccountInPool(tokens);
+				return tokens;
+			}
+			return { type: "failed" as const };
 		},
 	});
 	return {
@@ -289,10 +360,36 @@ export const OpenAIAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 								},
 							);
 
-							const response = await fetch(url, {
-								...requestInit,
-								headers,
-							});
+							let response: Response | null = null;
+							let transientRetries = 0;
+							for (; transientRetries <= MAX_TRANSIENT_RETRIES; transientRetries++) {
+								response = await fetch(url, {
+									...requestInit,
+									headers,
+								});
+
+								if (!TRANSIENT_RETRY_STATUSES.has(response.status)) {
+									break;
+								}
+								if (transientRetries >= MAX_TRANSIENT_RETRIES) {
+									break;
+								}
+
+								const delayMs = getTransientRetryDelayMs(
+									transientRetries,
+									response.headers,
+								);
+								logWarn("Transient upstream error, retrying request", {
+									status: response.status,
+									accountId: selected.accountId,
+									retry: transientRetries + 1,
+									delayMs,
+								});
+								await sleep(delayMs);
+							}
+							if (!response) {
+								continue;
+							}
 
 							logRequest(LOG_STAGES.RESPONSE, {
 								status: response.status,
@@ -302,6 +399,7 @@ export const OpenAIAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 								accountId: selected.accountId,
 								attempt: i + 1,
 								totalAttempts: attempts,
+								transientRetries,
 							});
 
 							if (!response.ok) {
@@ -350,10 +448,10 @@ export const OpenAIAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 					},
 				};
 			},
-				methods: [
-					{
-						label: AUTH_LABELS.OAUTH,
-						type: "oauth" as const,
+			methods: [
+				{
+					label: AUTH_LABELS.OAUTH,
+					type: "oauth" as const,
 					/**
 					 * OAuth authorization flow
 					 *
@@ -396,25 +494,27 @@ export const OpenAIAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 									REDIRECT_URI,
 								);
 
-								return tokens?.type === "success"
-									? tokens
-									: { type: "failed" as const };
+								if (tokens?.type === "success") {
+									persistOAuthAccountInPool(tokens);
+									return tokens;
+								}
+								return { type: "failed" as const };
 							},
 						};
 					},
+				},
+				{
+					label: AUTH_LABELS.OAUTH_MANUAL,
+					type: "oauth" as const,
+					authorize: async () => {
+						const { pkce, url } = await createAuthorizationFlow();
+						return buildManualOAuthFlow(pkce, url);
 					},
-					{
-						label: AUTH_LABELS.OAUTH_MANUAL,
-						type: "oauth" as const,
-						authorize: async () => {
-							const { pkce, url } = await createAuthorizationFlow();
-							return buildManualOAuthFlow(pkce, url);
-						},
-					},
-					{
-						label: AUTH_LABELS.API_KEY,
-						type: "api" as const,
-					},
+				},
+				{
+					label: AUTH_LABELS.API_KEY,
+					type: "api" as const,
+				},
 			],
 		},
 	};

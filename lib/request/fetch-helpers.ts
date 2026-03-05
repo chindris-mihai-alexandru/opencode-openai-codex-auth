@@ -203,7 +203,7 @@ export function createCodexHeaders(
 export async function handleErrorResponse(
     response: Response,
 ): Promise<Response> {
-	const mapped = await mapUsageLimit404(response);
+	const mapped = await mapUsageLimitTo429(response);
 	const finalResponse = mapped ?? response;
 
 	logRequest(LOG_STAGES.ERROR_RESPONSE, {
@@ -241,8 +241,14 @@ export async function handleSuccessResponse(
 	});
 }
 
-async function mapUsageLimit404(response: Response): Promise<Response | null> {
-	if (response.status !== HTTP_STATUS.NOT_FOUND) return null;
+async function mapUsageLimitTo429(response: Response): Promise<Response | null> {
+	const retryableUsageStatuses = new Set<number>([
+		HTTP_STATUS.BAD_REQUEST,
+		HTTP_STATUS.UNAUTHORIZED,
+		HTTP_STATUS.FORBIDDEN,
+		HTTP_STATUS.NOT_FOUND,
+	]);
+	if (!retryableUsageStatuses.has(response.status)) return null;
 
 	const clone = response.clone();
 	let text = "";

@@ -149,6 +149,20 @@ describe('Fetch Helpers Module', () => {
 			expect(json.error.code).toBe('usage_limit_reached');
 		});
 
+		it('maps usage-limit 403 errors to 429', async () => {
+			const body = {
+				error: {
+					code: 'usage_not_included',
+					message: 'account usage is temporarily unavailable',
+				},
+			};
+			const resp = new Response(JSON.stringify(body), { status: 403 });
+			const mapped = await handleErrorResponse(resp);
+			expect(mapped.status).toBe(429);
+			const json = await mapped.json() as any;
+			expect(json.error.code).toBe('usage_not_included');
+		});
+
 		it('leaves non-usage 404 errors unchanged', async () => {
 			const body = { error: { code: 'not_found', message: 'nope' } };
 			const resp = new Response(JSON.stringify(body), { status: 404 });
