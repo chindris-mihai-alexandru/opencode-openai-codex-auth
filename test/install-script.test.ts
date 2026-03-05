@@ -7,9 +7,14 @@ import { parse } from 'jsonc-parser';
 
 const SCRIPT_PATH = resolve(process.cwd(), 'scripts', 'install-opencode-codex-auth.js');
 
-const runInstaller = (args: string[], homeDir: string) => {
+const runInstaller = (args: string[], homeDir: string, extraEnv: Record<string, string> = {}) => {
 	execFileSync(process.execPath, [SCRIPT_PATH, ...args], {
-		env: { ...process.env, HOME: homeDir },
+		env: {
+			...process.env,
+			HOME: homeDir,
+			OPENCODE_DISABLE_COMPAT_FILE_PLUGIN: '1',
+			...extraEnv,
+		},
 		stdio: 'pipe',
 	});
 };
@@ -144,5 +149,24 @@ describe('Install script', () => {
 		expect(existsSync(join(opencodeDir, 'openai-codex-auth-config.json'))).toBe(false);
 		expect(existsSync(join(opencodeDir, 'logs', 'codex-plugin'))).toBe(false);
 		expect(existsSync(join(opencodeDir, 'cache', 'codex-instructions.md'))).toBe(false);
+	});
+
+	it('writes compatibility file:// plugin shim when forced', () => {
+		const homeDir = makeHome();
+		runInstaller(['--no-cache-clear'], homeDir, {
+			OPENCODE_FORCE_COMPAT_FILE_PLUGIN: '1',
+			OPENCODE_DISABLE_COMPAT_FILE_PLUGIN: '0',
+		});
+
+		const configPath = join(homeDir, '.config', 'opencode', 'opencode.jsonc');
+		const { data } = readJsoncFile(configPath);
+		expect(data.plugin[0]).toContain('file://');
+		expect(data.plugin[0]).toContain('/.opencode/plugins/codex-auth-bridge/index.mjs');
+
+		const shimPath = join(homeDir, '.opencode', 'plugins', 'codex-auth-bridge', 'index.mjs');
+		expect(existsSync(shimPath)).toBe(true);
+		const shim = readFileSync(shimPath, 'utf-8');
+		expect(shim).toContain('export { default } from');
+		expect(shim).toContain('index.ts');
 	});
 });

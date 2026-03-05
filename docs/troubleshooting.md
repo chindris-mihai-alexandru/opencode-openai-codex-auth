@@ -67,6 +67,32 @@ lsof -i :1455
 - Stop Codex CLI if running
 - Both use port 1455 for OAuth
 
+### Plugin Configured But Not Loaded
+
+**Symptoms:**
+- Plugin is listed in `~/.config/opencode/opencode.json` but logs do not show it loading
+- Account pool file never appears at `~/.opencode/openai-codex-accounts.json`
+
+**Cause:**
+- Some OpenCode versions skip `opencode-openai-codex-auth` by package-name match in the plugin loader
+
+**Fix:**
+```bash
+# Re-run installer (auto-detects and enables file:// shim mode when needed)
+npx -y opencode-openai-codex-auth@latest
+
+# Force shim mode manually if needed
+OPENCODE_FORCE_COMPAT_FILE_PLUGIN=1 npx -y opencode-openai-codex-auth@latest
+```
+
+**Verify:**
+```bash
+opencode run "ping" --model=openai/gpt-5.2 --variant=medium --print-logs --log-level DEBUG
+node scripts/debug-account-pool.js
+```
+
+You should see plugin loading from a `file://.../codex-auth-bridge/index.mjs` entry and a populated account pool file.
+
 ### "Invalid Session" or "Authorization session expired"
 
 **Symptoms:**

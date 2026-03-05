@@ -41,6 +41,15 @@ Uninstall:
 npx -y opencode-openai-codex-auth@latest --uninstall
 npx -y opencode-openai-codex-auth@latest --uninstall --all
 ```
+
+Installer compatibility controls:
+```bash
+# Force file:// shim mode (for OpenCode builds that skip npm plugin entry)
+OPENCODE_FORCE_COMPAT_FILE_PLUGIN=1 npx -y opencode-openai-codex-auth@latest
+
+# Disable file:// shim mode
+OPENCODE_DISABLE_COMPAT_FILE_PLUGIN=1 npx -y opencode-openai-codex-auth@latest
+```
 ---
 ## 📦 Models
 - **gpt-5.2** (none/low/medium/high/xhigh)
@@ -73,5 +82,10 @@ Minimal configs are not supported for GPT‑5.x; use the full configs above.
 ## ⚠️ Usage Notice
 This plugin is for **personal development use** with your own ChatGPT Plus/Pro subscription.
 For production or multi‑user applications, use the OpenAI Platform API.
+
+## Compatibility Note
+- Some OpenCode versions include a loader guard that skips `opencode-openai-codex-auth` when configured by package name.
+- Installer now auto-detects this and writes a neutral `file://` shim entry at `~/.opencode/plugins/codex-auth-bridge/index.mjs`.
+- If your global config contains `opencode.json.bak-*`, that is an installer rollback backup. It is safe to keep or delete after you verify config is correct.
 
 **Built for developers who value simplicity.**

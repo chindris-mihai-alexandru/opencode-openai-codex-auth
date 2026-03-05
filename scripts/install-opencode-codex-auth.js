@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { readFile, writeFile, mkdir, copyFile, rm } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { parse, modify, applyEdits, printParseErrorCode } from "jsonc-parser";
@@ -59,29 +60,125 @@ const pluginConfigPath = join(
 const pluginAccountsPath = join(homedir(), ".opencode", "openai-codex-accounts.json");
 const pluginLogDir = join(homedir(), ".opencode", "logs", "codex-plugin");
 const opencodeCacheDir = join(homedir(), ".opencode", "cache");
+const compatPluginDir = join(homedir(), ".opencode", "plugins", "codex-auth-bridge");
+const compatPluginShimPath = join(compatPluginDir, "index.mjs");
+const compatPluginEntry = pathToFileURL(compatPluginShimPath).toString();
+const opencodeSourcePluginIndexPath = join(
+	homedir(),
+	".config",
+	"opencode",
+	"opencode",
+	"packages",
+	"opencode",
+	"src",
+	"plugin",
+	"index.ts",
+);
+
+function truthyEnv(name) {
+	const value = process.env[name];
+	if (!value) return false;
+	const normalized = value.toLowerCase();
+	return normalized === "1" || normalized === "true" || normalized === "yes";
+}
 
 function log(message) {
 	console.log(message);
 }
 
-function normalizePluginList(list) {
+function normalizePluginList(list, desiredEntry) {
 	const entries = Array.isArray(list) ? list.filter(Boolean) : [];
 	const filtered = entries.filter((entry) => {
 		if (typeof entry !== "string") return true;
+		if (entry === desiredEntry) return false;
+		if (entry === compatPluginEntry) return false;
 		return entry !== PLUGIN_NAME && !entry.startsWith(`${PLUGIN_NAME}@`);
 	});
-	return [...filtered, PLUGIN_NAME];
+	return [...filtered, desiredEntry];
 }
 
 function removePluginEntries(list) {
 	const entries = Array.isArray(list) ? list.filter(Boolean) : [];
 	return entries.filter((entry) => {
 		if (typeof entry !== "string") return true;
+		if (entry === compatPluginEntry) {
+			return false;
+		}
 		if (entry === PLUGIN_NAME || entry.startsWith(`${PLUGIN_NAME}@`)) {
 			return false;
 		}
 		return !entry.includes(PLUGIN_NAME);
 	});
+}
+
+function compareSemver(a, b) {
+	const [aMajor, aMinor, aPatch] = a;
+	const [bMajor, bMinor, bPatch] = b;
+	if (aMajor !== bMajor) return aMajor - bMajor;
+	if (aMinor !== bMinor) return aMinor - bMinor;
+	return aPatch - bPatch;
+}
+
+function parseSemver(value) {
+	const match = value.match(/(\d+)\.(\d+)\.(\d+)/);
+	if (!match) return null;
+	return [
+		Number.parseInt(match[1], 10),
+		Number.parseInt(match[2], 10),
+		Number.parseInt(match[3], 10),
+	];
+}
+
+function shouldUseCompatPluginEntry() {
+	if (truthyEnv("OPENCODE_DISABLE_COMPAT_FILE_PLUGIN")) {
+		return { enabled: false, reason: "disabled via env" };
+	}
+	if (truthyEnv("OPENCODE_FORCE_COMPAT_FILE_PLUGIN")) {
+		return { enabled: true, reason: "forced via env" };
+	}
+
+	if (existsSync(opencodeSourcePluginIndexPath)) {
+		try {
+			const source = readFileSync(opencodeSourcePluginIndexPath, "utf-8");
+			if (source.includes("plugin.includes(\"opencode-openai-codex-auth\")")) {
+				return { enabled: true, reason: "detected plugin skip gate in OpenCode source" };
+			}
+		} catch {
+			// Ignore source inspection errors and fall back to version detection.
+		}
+	}
+
+	try {
+		const versionRaw = execFileSync("opencode", ["--version"], {
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		const parsed = parseSemver(versionRaw);
+		if (parsed && compareSemver(parsed, [1, 1, 56]) >= 0) {
+			return { enabled: true, reason: `OpenCode ${versionRaw} likely contains plugin skip gate` };
+		}
+	} catch {
+		// OpenCode may not be installed yet.
+	}
+
+	return { enabled: false, reason: "no skip gate detected" };
+}
+
+async function ensureCompatPluginShim(targetPath) {
+	const targetUrl = pathToFileURL(targetPath).toString();
+	const content = [
+		`export { default } from ${JSON.stringify(targetUrl)};`,
+		`export * from ${JSON.stringify(targetUrl)};`,
+		"",
+	].join("\n");
+
+	if (dryRun) {
+		log(`[dry-run] Would write compatibility shim at ${compatPluginShimPath}`);
+		return;
+	}
+
+	await mkdir(compatPluginDir, { recursive: true });
+	await writeFile(compatPluginShimPath, content, "utf-8");
 }
 
 function mergeOpenAIConfig(existingOpenAI, templateOpenAI) {
@@ -255,11 +352,13 @@ async function clearPluginArtifacts() {
 		log(`[dry-run] Would remove ${pluginConfigPath}`);
 		log(`[dry-run] Would remove ${pluginAccountsPath}`);
 		log(`[dry-run] Would remove ${pluginLogDir}`);
+		log(`[dry-run] Would remove ${compatPluginDir}`);
 	} else {
 		await rm(opencodeAuthPath, { force: true });
 		await rm(pluginConfigPath, { force: true });
 		await rm(pluginAccountsPath, { force: true });
 		await rm(pluginLogDir, { recursive: true, force: true });
+		await rm(compatPluginDir, { recursive: true, force: true });
 	}
 
 	const cacheFiles = [
@@ -372,7 +471,14 @@ async function main() {
 	}
 
 	const template = await readJson(templatePath);
-	template.plugin = [PLUGIN_NAME];
+	const compatMode = shouldUseCompatPluginEntry();
+	const desiredPluginEntry = compatMode.enabled ? compatPluginEntry : PLUGIN_NAME;
+	template.plugin = [desiredPluginEntry];
+
+	if (compatMode.enabled) {
+		await ensureCompatPluginShim(join(repoRoot, "index.ts"));
+		log(`Compatibility mode enabled: using file plugin shim (${compatMode.reason}).`);
+	}
 
 	let nextConfig = template;
 	let nextContent = null;
@@ -385,7 +491,7 @@ async function main() {
 			const { content, data } = await readJsonc(configPath);
 			const existing = data ?? {};
 			const merged = { ...existing };
-			merged.plugin = normalizePluginList(existing.plugin);
+			merged.plugin = normalizePluginList(existing.plugin, desiredPluginEntry);
 			const provider =
 				existing.provider && typeof existing.provider === "object"
 					? { ...existing.provider }
@@ -422,6 +528,9 @@ async function main() {
 
 	log("\nDone. Restart OpenCode to (re)install the plugin.");
 	log("Example: opencode");
+	if (compatMode.enabled) {
+		log(`Compat plugin entry written: ${compatPluginEntry}`);
+	}
 	if (useLegacy) {
 		log("Note: Legacy config requires OpenCode v1.0.209 or older.");
 	}
